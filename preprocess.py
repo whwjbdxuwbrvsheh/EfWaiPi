@@ -1,9 +1,10 @@
 import spacy
 import nltk
+from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
- 
+
 nltk.download('stopwords', quiet=True)
- 
+
 # Load once at module level — avoids reloading on every call
 try:
     nlp = spacy.load('en_core_web_sm', disable=['parser', 'ner'])  # faster: only need tagger/lemmatizer
@@ -11,33 +12,36 @@ except OSError:
     raise OSError(
         "spaCy model not found. Run: python -m spacy download en_core_web_sm"
     )
- 
- 
+
+NLTK_STOPWORDS = set(stopwords.words('english'))
+
+
 def preprocess(text: str) -> str:
     """
     Clean and normalise raw email text:
       1. Lowercase
       2. Tokenise via spaCy
-      3. Remove stopwords, punctuation, non-alpha tokens, very short tokens
+      3. Remove stopwords (spaCy + NLTK), punctuation, non-alpha tokens, very short tokens
       4. Lemmatise
     Returns a single cleaned string ready for TF-IDF.
     """
     if not isinstance(text, str) or not text.strip():
         return ""
- 
+
     doc = nlp(text.lower())
- 
+
     tokens = [
         token.lemma_
         for token in doc
         if (
             not token.is_stop
+            and token.lemma_ not in NLTK_STOPWORDS
             and not token.is_punct
             and token.is_alpha
             and len(token.text) > 2          # drop single/double char noise
         )
     ]
- 
+
     return ' '.join(tokens)
  
  
