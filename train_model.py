@@ -38,16 +38,11 @@ def trust_score(sender: str) -> float:
 # LOAD DATASETS
 # ---------------------------------
 
-df1 = pd.read_csv("data/test_dataset.csv")
-df2 = pd.read_csv("data/SpamAssasin.csv")
+df = pd.read_csv("data/phishing_dataset_final.csv")
 
 required = ["subject", "body", "label"]
 
-df1 = df1[required]
-df2 = df2[required]
-
-df = pd.concat([df1, df2], ignore_index=True)
-
+df = df[required]
 df = df.dropna(subset=required)
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
