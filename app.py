@@ -1,6 +1,10 @@
 # app.py
 
 import os
+import re
+import html
+import time
+import logging
 import pickle
 import numpy as np
 import streamlit as st
@@ -9,6 +13,27 @@ from scipy.sparse import hstack
 
 from preprocess import preprocess
 from score import score_label, sophistication_score
+from virustotal import extract_urls, scan_urls
+
+# -------------------------------------------------
+# SECURITY CONSTANTS
+# -------------------------------------------------
+
+MAX_INPUT_LENGTH = 50_000   # characters
+MAX_REQUESTS     = 5        # per session window
+WINDOW_SECONDS   = 60
+
+# -------------------------------------------------
+# AUDIT LOGGING  (#10)
+# -------------------------------------------------
+
+logging.basicConfig(
+    filename="audit.log",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_audit = logging.getLogger("phishing_detector")
 
 # -------------------------------------------------
 # TRUSTED DOMAINS
@@ -19,17 +44,50 @@ TRUSTED_DOMAINS = [
     "microsoft.com",
     "apple.com",
     "github.com",
-    "amazon.com"
+    "amazon.com",
 ]
 
 def trust_score(text: str) -> float:
     text = str(text).lower()
-
     for domain in TRUSTED_DOMAINS:
         if domain in text:
             return 0.9
-
     return 0.3
+
+
+# -------------------------------------------------
+# SECURITY HELPERS
+# -------------------------------------------------
+
+def sanitize_input(text: str) -> str:
+    """XSS prevention (#8) + data-layer sanitization (#4): strip scripts and HTML tags."""
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    return text
+
+
+def mask_pii(text: str) -> str:
+    """PII masking (#7): redact emails, phone numbers, and card numbers before processing."""
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL]', text)
+    text = re.sub(r'\b(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', '[PHONE]', text)
+    text = re.sub(r'\b(?:\d{4}[-\s]?){3}\d{4}\b', '[CARD]', text)
+    return text
+
+
+def check_rate_limit() -> bool:
+    """Rate limiting (#6): allow at most MAX_REQUESTS analyses per WINDOW_SECONDS."""
+    now = time.time()
+    if "request_timestamps" not in st.session_state:
+        st.session_state.request_timestamps = []
+    st.session_state.request_timestamps = [
+        t for t in st.session_state.request_timestamps
+        if now - t < WINDOW_SECONDS
+    ]
+    if len(st.session_state.request_timestamps) >= MAX_REQUESTS:
+        return False
+    st.session_state.request_timestamps.append(now)
+    return True
 
 
 # -------------------------------------------------
@@ -113,8 +171,11 @@ email_input = st.text_area(
     placeholder="Paste subject + body here..."
 )
 
+vt_enabled = st.toggle("Check URLs with VirusTotal", value=True)
+st.caption("URL analysis powered by VirusTotal (free tier — 500 checks/day)")
+
 analyse_btn = st.button(
-    "🔍 Analyse Email",
+    "Analyse Email",
     type="primary",
     use_container_width=True
 )
@@ -125,13 +186,31 @@ analyse_btn = st.button(
 
 if analyse_btn:
 
-    if not email_input.strip():
+    # --- Input Validation (#3) ---
+    if not isinstance(email_input, str) or not email_input.strip():
         st.warning("Paste an email first.")
+        st.stop()
+
+    if len(email_input) > MAX_INPUT_LENGTH:
+        st.error(f"Input too long. Maximum {MAX_INPUT_LENGTH:,} characters allowed.")
+        _audit.warning("input_rejected | reason=too_long | len=%d", len(email_input))
+        st.stop()
+
+    # --- Rate Limiting (#6) ---
+    if not check_rate_limit():
+        st.error(f"Rate limit reached: maximum {MAX_REQUESTS} analyses per {WINDOW_SECONDS} seconds. Please wait.")
+        _audit.warning("rate_limit_exceeded")
         st.stop()
 
     with st.spinner("Analysing... because apparently trust issues need automation."):
 
-        clean_text = preprocess(email_input)
+        # --- XSS Prevention + Data Layer Sanitization (#8, #4) ---
+        safe_input = sanitize_input(email_input)
+
+        # --- PII Masking (#7) ---
+        safe_input = mask_pii(safe_input)
+
+        clean_text = preprocess(safe_input)
 
         if not clean_text.strip():
             st.error("No usable text after preprocessing.")
@@ -147,7 +226,7 @@ if analyse_btn:
         # TRUST FEATURE (MUST MATCH TRAINING)
         # -----------------------------------------
 
-        score_trust = trust_score(email_input)
+        score_trust = trust_score(safe_input)
         vec_trust = np.array([[score_trust]])
 
         vec = hstack([vec_text, vec_trust])
@@ -168,15 +247,21 @@ if analyse_btn:
         # SOPHISTICATION SCORE
         # -----------------------------------------
 
-        score, found, explanation = sophistication_score(email_input, prob)
+        score, found, explanation = sophistication_score(safe_input, prob)
         risk = score_label(score)
+
+        # --- Audit Log (#10) ---
+        _audit.info(
+            "analysis | input_len=%d | label=%s | prob=%.3f | score=%s | risk=%s",
+            len(email_input), label, prob, score, risk,
+        )
 
 # -------------------------------------------------
 # RESULTS
 # -------------------------------------------------
 
     st.divider()
-    st.subheader("Results")
+    st.subheader("Results", anchor=False)
 
     col1, col2, col3 = st.columns(3)
 
@@ -213,7 +298,7 @@ if analyse_btn:
 # TECHNIQUES
 # -------------------------------------------------
 
-    st.subheader("Manipulation Techniques Detected")
+    st.subheader("Manipulation Techniques Detected", anchor=False)
 
     tag_classes = {
         "urgency": "tag-urgency",
@@ -239,6 +324,38 @@ if analyse_btn:
                 )
     else:
         st.info("No manipulation techniques detected.")
+
+# -------------------------------------------------
+# URL SCAN (VIRUSTOTAL)
+# -------------------------------------------------
+
+    st.divider()
+    st.subheader("🔗 URL Scan (VirusTotal)", anchor=False)
+
+    if not vt_enabled:
+        st.info("URL scanning disabled.")
+    else:
+        urls = extract_urls(email_input)
+
+        if not urls:
+            st.info("No URLs found in this email.")
+        else:
+            st.caption(f"Scanning {len(urls)} URL(s) — this may take a few seconds...")
+
+            vt_results = scan_urls(urls)
+
+            for r in vt_results:
+                url_display = f"`{r['url']}`"
+                if r["status"] == "malicious":
+                    st.error(f"🔴 **Malicious** — {r['malicious']}/{r['total']} engines flagged {url_display}")
+                elif r["status"] == "suspicious":
+                    st.warning(f"🟡 **Suspicious** — {r['suspicious']}/{r['total']} engines flagged {url_display}")
+                elif r["status"] == "clean":
+                    st.success(f"✅ **Clean** — 0/{r['total']} engines flagged {url_display}")
+                else:
+                    st.warning(f"⚠️ Could not scan {url_display}")
+
+            _audit.info("url_scan | count=%d | urls=%s", len(vt_results), [r["url"] for r in vt_results])
 
 # -------------------------------------------------
 # DEBUG TOKENS
